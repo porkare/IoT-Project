@@ -1,0 +1,252 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body with BME68x integration + UART CLI + E22 LoRa
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+#include "main.h"
+#include "bme68x.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+UART_HandleTypeDef huart2; // CLI
+UART_HandleTypeDef huart1; // LoRa E22
+
+struct bme68x_dev gas_sensor;
+uint16_t bme68x_i2c_addr = 0x77;
+
+/* E22 mode pins */
+#define E22_M0_Pin GPIO_PIN_0
+#define E22_M0_GPIO_Port GPIOB
+#define E22_M1_Pin GPIO_PIN_1
+#define E22_M1_GPIO_Port GPIOB
+
+/* Function prototypes ---------------------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_I2C1_Init(void);
+void BME68x_Init(void);
+void Read_Temperature(void);
+void Read_Pressure(void);
+void Read_Humidity(void);
+void Read_Gas(void);
+void Show_Help_Menu(void);
+void Do_Sum(char *args);
+void Error_Handler(void);
+void E22_SetMode(uint8_t m0, uint8_t m1);
+void Send_BME_Data_LoRa(void);
+
+/* Redirect printf to UART2 */
+int __io_putchar(int ch) {
+    HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+    return ch;
+}
+
+/* I2C read/write/delay functions for BME68x */
+int8_t user_i2c_read(uint8_t reg_addr, uint8_t *reg_data, uint32_t len, void *intf_ptr) {
+    uint16_t dev_addr = *(uint16_t *)intf_ptr;
+    return (HAL_I2C_Mem_Read(&hi2c1, dev_addr << 1, reg_addr, I2C_MEMADD_SIZE_8BIT, reg_data, len, 100) == HAL_OK) ? BME68X_OK : BME68X_E_COM_FAIL;
+}
+
+int8_t user_i2c_write(uint8_t reg_addr, const uint8_t *reg_data, uint32_t len, void *intf_ptr) {
+    uint16_t dev_addr = *(uint16_t *)intf_ptr;
+    return (HAL_I2C_Mem_Write(&hi2c1, dev_addr << 1, reg_addr, I2C_MEMADD_SIZE_8BIT, (uint8_t *)reg_data, len, 100) == HAL_OK) ? BME68X_OK : BME68X_E_COM_FAIL;
+}
+
+void user_delay_ms(uint32_t period, void *intf_ptr) {
+    HAL_Delay(period);
+}
+
+/* BME68x Initialization */
+void BME68x_Init(void) {
+    gas_sensor.intf = BME68X_I2C_INTF;
+    gas_sensor.read = user_i2c_read;
+    gas_sensor.write = user_i2c_write;
+    gas_sensor.delay_us = user_delay_ms;
+    gas_sensor.intf_ptr = &bme68x_i2c_addr;
+    gas_sensor.amb_temp = 25;
+
+    int8_t rslt = bme68x_init(&gas_sensor);
+    if (rslt != BME68X_OK) {
+        printf("BME68x init failed with code %d\r\n", rslt);
+        Error_Handler();
+    }
+
+    struct bme68x_conf conf = {
+        .os_hum = BME68X_OS_2X,
+        .os_pres = BME68X_OS_4X,
+        .os_temp = BME68X_OS_8X,
+        .filter = BME68X_FILTER_OFF,
+        .odr = BME68X_ODR_NONE
+    };
+    bme68x_set_conf(&conf, &gas_sensor);
+
+    struct bme68x_heatr_conf heatr_conf = {
+        .enable = BME68X_ENABLE,
+        .heatr_temp = 320,
+        .heatr_dur = 150
+    };
+    bme68x_set_heatr_conf(BME68X_FORCED_MODE, &heatr_conf, &gas_sensor);
+}
+
+/* Individual reading functions */
+void Read_Temperature(void) {
+    struct bme68x_data data;
+    uint8_t n_fields;
+    bme68x_set_op_mode(BME68X_FORCED_MODE, &gas_sensor);
+    gas_sensor.delay_us(200, gas_sensor.intf_ptr);
+    if (bme68x_get_data(BME68X_FORCED_MODE, &data, &n_fields, &gas_sensor) == BME68X_OK && n_fields) {
+        printf("\r\nTemperature: %.2f °C\r\n", data.temperature);
+    } else {
+        printf("\r\nFailed to read temperature.\r\n");
+    }
+}
+
+void Read_Pressure(void) {
+    struct bme68x_data data;
+    uint8_t n_fields;
+    bme68x_set_op_mode(BME68X_FORCED_MODE, &gas_sensor);
+    gas_sensor.delay_us(200, gas_sensor.intf_ptr);
+    if (bme68x_get_data(BME68X_FORCED_MODE, &data, &n_fields, &gas_sensor) == BME68X_OK && n_fields) {
+        printf("\r\nPressure: %.2f hPa\r\n", data.pressure / 100.0f);
+    } else {
+        printf("\r\nFailed to read pressure.\r\n");
+    }
+}
+
+void Read_Humidity(void) {
+    struct bme68x_data data;
+    uint8_t n_fields;
+    bme68x_set_op_mode(BME68X_FORCED_MODE, &gas_sensor);
+    gas_sensor.delay_us(200, gas_sensor.intf_ptr);
+    if (bme68x_get_data(BME68X_FORCED_MODE, &data, &n_fields, &gas_sensor) == BME68X_OK && n_fields) {
+        printf("\r\nHumidity: %.2f %%\r\n", data.humidity);
+    } else {
+        printf("\r\nFailed to read humidity.\r\n");
+    }
+}
+
+void Read_Gas(void) {
+    struct bme68x_data data;
+    uint8_t n_fields;
+    bme68x_set_op_mode(BME68X_FORCED_MODE, &gas_sensor);
+    gas_sensor.delay_us(200, gas_sensor.intf_ptr);
+    if (bme68x_get_data(BME68X_FORCED_MODE, &data, &n_fields, &gas_sensor) == BME68X_OK && n_fields) {
+        printf("\r\nGas resistance: %d ohm\r\n", data.gas_resistance);
+    } else {
+        printf("\r\nFailed to read gas resistance.\r\n");
+    }
+}
+
+/* Show help menu */
+void Show_Help_Menu(void) {
+    printf("\r\nAvailable commands:\r\n");
+    printf("start / help   -> Show this help menu\r\n");
+    printf("temp           -> Read temperature only\r\n");
+    printf("press          -> Read pressure only\r\n");
+    printf("hum            -> Read humidity only\r\n");
+    printf("gas            -> Read gas resistance only\r\n");
+    printf("sum n1 n2      -> Sum two integers\r\n");
+    printf("lora           -> Send all BME data via LoRa\r\n");
+}
+
+/* Sum function */
+void Do_Sum(char *args) {
+    int a = 0, b = 0;
+    if (sscanf(args, "%d %d", &a, &b) == 2) {
+        printf("\r\nSum: %d\r\n", a + b);
+    } else {
+        printf("\r\nInvalid arguments. Usage: sum n1 n2\r\n");
+    }
+}
+
+/* Set E22 LoRa module mode */
+void E22_SetMode(uint8_t m0, uint8_t m1) {
+    HAL_GPIO_WritePin(E22_M0_GPIO_Port, E22_M0_Pin, m0 ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(E22_M1_GPIO_Port, E22_M1_Pin, m1 ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_Delay(50);
+}
+
+/* Send BME data to LoRa */
+void Send_BME_Data_LoRa(void) {
+    struct bme68x_data data;
+    uint8_t n_fields;
+    bme68x_set_op_mode(BME68X_FORCED_MODE, &gas_sensor);
+    gas_sensor.delay_us(200, gas_sensor.intf_ptr);
+
+    if (bme68x_get_data(BME68X_FORCED_MODE, &data, &n_fields, &gas_sensor) == BME68X_OK && n_fields) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "T:%.1f,P:%.1f,H:%.1f,G:%d\n",
+                 data.temperature, data.pressure / 100.0f, data.humidity, data.gas_resistance);
+        HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+        printf("\r\nSent to LoRa: %s\r\n", msg);
+    } else {
+        printf("\r\nFailed to read BME68x data for LoRa.\r\n");
+    }
+}
+
+/* Application entry point */
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_USART2_UART_Init();
+    MX_USART1_UART_Init();
+    MX_I2C1_Init();
+
+    BME68x_Init();
+    E22_SetMode(0, 0);
+
+    char rx_buffer[64];
+    uint8_t rx_char;
+    uint8_t idx = 0;
+
+    Show_Help_Menu();
+
+    while (1) {
+        printf("\r\nEnter command: ");
+        memset(rx_buffer, 0, sizeof(rx_buffer));
+        idx = 0;
+
+        while (1) {
+            if (HAL_UART_Receive(&huart2, &rx_char, 1, HAL_MAX_DELAY) == HAL_OK) {
+                HAL_UART_Transmit(&huart2, &rx_char, 1, HAL_MAX_DELAY);
+                if (rx_char == '\r' || rx_char == '\n') {
+                    rx_buffer[idx] = '\0';
+                    break;
+                } else {
+                    if (idx < sizeof(rx_buffer) - 1) {
+                        rx_buffer[idx++] = rx_char;
+                    }
+                }
+            }
+        }
+
+        if (strncmp(rx_buffer, "start", 5) == 0 || strncmp(rx_buffer, "help", 4) == 0) {
+            Show_Help_Menu();
+        } else if (strncmp(rx_buffer, "temp", 4) == 0) {
+            Read_Temperature();
+        } else if (strncmp(rx_buffer, "press", 5) == 0) {
+            Read_Pressure();
+        } else if (strncmp(rx_buffer, "hum", 3) == 0) {
+            Read_Humidity();
+        } else if (strncmp(rx_buffer, "gas", 3) == 0) {
+            Read_Gas();
+        } else if (strncmp(rx_buffer, "sum", 3) == 0) {
+            Do_Sum(rx_buffer + 4);
+        } else if (strncmp(rx_buffer, "lora", 4) == 0) {
+            Send_BME_Data_LoRa();
+        } else {
+            printf("\r\nUnknown command. Type 'help' for available commands.\r\n");
+        }
+    }
+}
